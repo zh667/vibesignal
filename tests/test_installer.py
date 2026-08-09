@@ -312,6 +312,126 @@ def _all_commands(spec: dict) -> list[str]:
             for entries in spec.values() for e in entries for h in e["hooks"]]
 
 
+def test_detect_codex_cli_reports_missing(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+
+    info = installer.detect_codex_cli()
+
+    assert info.path is None
+    assert info.version is None
+    assert info.raw_version is None
+    assert installer.codex_supports_session_end(info) is False
+
+
+@pytest.mark.parametrize(
+    ("output", "version", "supports_session_end"),
+    [
+        ("codex-cli 0.142.3\n", (0, 142, 3), False),
+        ("codex-cli 0.147.0-beta.1\n", (0, 147, 0), False),
+        ("codex-cli 0.147.0\n", (0, 147, 0), True),
+        ("codex-cli 0.150.2-beta.1\n", (0, 150, 2), True),
+        ("warning: Node.js 22.14.0 required\n", None, False),
+        ("Codex development build\n", None, False),
+    ],
+)
+def test_detect_codex_cli_parses_version_and_capability(
+    monkeypatch, output, version, supports_session_end
+):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: "/tools/codex")
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda command, **kwargs: installer.subprocess.CompletedProcess(
+            command, 0, stdout=output, stderr=""
+        ),
+    )
+
+    info = installer.detect_codex_cli()
+
+    assert info.path == "/tools/codex"
+    assert info.version == version
+    assert info.raw_version == output.strip()
+    assert installer.codex_supports_session_end(info) is supports_session_end
+
+
+@pytest.mark.parametrize(
+    ("output", "supports_base_hooks"),
+    [
+        ("codex-cli 0.142.2", False),
+        ("codex-cli 0.142.3-beta.1", False),
+        ("codex-cli 0.142.3", True),
+        ("codex-cli 0.147.0", True),
+    ],
+)
+def test_codex_base_hook_capability_has_verified_floor(
+    monkeypatch, output, supports_base_hooks
+):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: "/tools/codex")
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda command, **kwargs: installer.subprocess.CompletedProcess(
+            command, 0, stdout=output, stderr=""
+        ),
+    )
+
+    info = installer.detect_codex_cli()
+
+    assert installer.codex_supports_base_hooks(info) is supports_base_hooks
+
+
+def test_detect_codex_cli_decodes_subprocess_output_as_utf8(monkeypatch):
+    run_kwargs = {}
+    monkeypatch.setattr(installer.shutil, "which", lambda name: "/tools/codex")
+
+    def fake_run(command, **kwargs):
+        run_kwargs.update(kwargs)
+        return installer.subprocess.CompletedProcess(
+            command, 0, stdout="codex-cli 0.147.0", stderr=""
+        )
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    installer.detect_codex_cli()
+
+    assert run_kwargs["encoding"] == "utf-8"
+    assert run_kwargs["errors"] == "replace"
+
+
+def test_install_recommended_codex_cli_uses_exact_npm_version(monkeypatch):
+    calls = []
+
+    def fake_which(name):
+        return {"npm": "/tools/npm", "codex": "/tools/codex"}.get(name)
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "/tools/npm":
+            return installer.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return installer.subprocess.CompletedProcess(
+            command, 0, stdout="codex-cli 0.147.0\n", stderr=""
+        )
+
+    monkeypatch.setattr(installer.shutil, "which", fake_which)
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    info = installer.install_recommended_codex_cli()
+
+    assert calls[0][0] == [
+        "/tools/npm", "install", "-g", "@openai/codex@0.147.0"
+    ]
+    assert calls[0][1]["encoding"] == "utf-8"
+    assert calls[0][1]["errors"] == "replace"
+    assert info.version == (0, 147, 0)
+
+
+def test_install_recommended_codex_cli_requires_npm(monkeypatch):
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+
+    with pytest.raises(installer.CodexCliInstallError, match="npm"):
+        installer.install_recommended_codex_cli()
+
+
 def test_agent_hooks_spec_claude_shape():
     spec = installer.agent_hooks_spec(["/env/bin/vibesignal"], "claude")
     assert set(spec) == {"UserPromptSubmit", "PostToolUse", "Notification",
@@ -334,6 +454,17 @@ def test_agent_hooks_spec_claude_shape():
 def test_agent_hooks_spec_codex_tag():
     spec = installer.agent_hooks_spec(["/env/bin/vibesignal"], "codex")
     assert all("--agent codex" in c for c in _all_commands(spec))
+
+
+def test_agent_hooks_spec_codex_without_session_end_is_compatibility_mode():
+    spec = installer.agent_hooks_spec(
+        ["/env/bin/vibesignal"], "codex", include_session_end=False
+    )
+
+    assert set(spec) == {
+        "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Stop"
+    }
+    assert "SessionEnd" not in spec
 
 
 def test_hook_command_quotes_spaces(monkeypatch):
@@ -446,6 +577,31 @@ def test_install_hooks_codex_targets_codex_file(monkeypatch, tmp_path):
     installer.install_hooks("codex")
     data = json.loads(codex_file.read_text())
     assert "--agent codex" in data["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+
+def test_install_hooks_codex_compatibility_removes_only_our_session_end(
+    monkeypatch, tmp_path
+):
+    codex_file = tmp_path / "hooks.json"
+    codex_file.write_text(json.dumps({"hooks": {"SessionEnd": [{"hooks": [
+        {"type": "command", "command": "/old/vibesignal end --agent codex --quiet"},
+        {"type": "command", "command": "/opt/foreign-cleanup"},
+    ]}]}}))
+    monkeypatch.setattr(installer, "codex_hooks_path", lambda: codex_file)
+    monkeypatch.setattr(installer, "vibesignal_args", lambda: ["/new/vibesignal"])
+
+    installer.install_hooks("codex", include_session_end=False)
+
+    hooks = json.loads(codex_file.read_text())["hooks"]
+    assert set(hooks) >= {
+        "UserPromptSubmit", "PostToolUse", "PermissionRequest", "Stop"
+    }
+    session_end_commands = [
+        handler["command"]
+        for entry in hooks["SessionEnd"]
+        for handler in entry["hooks"]
+    ]
+    assert session_end_commands == ["/opt/foreign-cleanup"]
 
 
 def test_uninstall_hooks_missing_file_is_false(monkeypatch, tmp_path):

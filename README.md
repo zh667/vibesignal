@@ -225,7 +225,42 @@ The state store is agent-agnostic: events carry an `--agent` tag, so one light c
 vibesignal install-hooks --agent codex   # writes ~/.codex/hooks.json, absolute path pinned
 ```
 
-Then trust the new hooks once via `/hooks` in a Codex session and restart it. Codex uses its own hook vocabulary — `PermissionRequest` for the blocked signal (Claude uses `Notification`), and no `SessionEnd`, so a closed Codex session ages out by its TTL rather than clearing at once.
+Then trust the new hooks once via `/hooks` in a Codex CLI session and restart
+Codex Desktop. Codex uses its own hook vocabulary: `PermissionRequest` provides
+the blocked signal (Claude uses `Notification`), while supported versions also
+provide `SessionEnd` for immediate cleanup.
+
+Before writing Codex Hooks, VibeSignal checks `codex --version`. Codex CLI
+`0.147.0` is the oldest version this project has directly verified can display
+and trust `SessionEnd` in `/hooks`; it is a tested baseline, not a claim about
+OpenAI's official minimum version.
+
+- If Codex CLI is missing, VibeSignal asks before running
+  `npm install -g @openai/codex@0.147.0`. Refusing leaves Codex Hook integration
+  disabled because there is no review path.
+- If the installed CLI is between `0.142.3` (the verified four-Hook review
+  floor) and `0.147.0`, VibeSignal asks before upgrading. Refusing installs a
+  compatibility mode that uses `Stop` and the state TTL for cleanup.
+- A CLI below `0.142.3`, or one whose version cannot be verified, is not used to
+  install Hooks because VibeSignal cannot guarantee that `/hooks` can review
+  them.
+- If the installed CLI is `0.147.0` or newer, VibeSignal keeps it and installs
+  all five Hooks, including `SessionEnd`. A newer CLI is never downgraded.
+- If an attempted upgrade fails, VibeSignal detects the CLI again. It falls back
+  only when a verified four-Hook reviewer still works; otherwise no Hooks are
+  written.
+
+For an outer GUI installer that has already collected explicit consent, pass
+`--yes` to approve the CLI install or upgrade without a second prompt:
+
+```bash
+vibesignal install-hooks --agent codex --yes
+```
+
+`--yes` never approves the Hooks themselves. The user must still open Codex CLI,
+enter `/hooks`, inspect the commands, and trust them manually before restarting
+Codex Desktop and sending a test prompt. Codex CLI is used for this review step;
+it is not a runtime dependency of the VibeSignal widget.
 
 To wire it by hand instead, merge [`hooks/codex-hooks.snippet.json`](hooks/codex-hooks.snippet.json) into `~/.codex/hooks.json` and trust via `/hooks`; the commands use `--quiet` because Codex hook types can parse stdout as JSON. If the hook shell cannot find `vibesignal`, use the absolute interpreter form, e.g. `C:/Users/<you>/miniforge3/envs/py312/python.exe -m vibesignal`. For older Codex (completion-only fallback), run [`hooks/codex-notify.py`](hooks/codex-notify.py) with the Python interpreter that has VibeSignal installed and point `~/.codex/config.toml` at it:
 

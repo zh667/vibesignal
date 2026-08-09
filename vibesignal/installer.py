@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import xml.sax.saxutils
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 from . import lock
@@ -35,10 +37,33 @@ LAUNCH_AGENT_LABEL = "io.github.yzhao062.vibesignal"
 APP_NAME = "VibeSignal.app"
 SHORTCUT_NAME = "VibeSignal.lnk"
 
+MIN_VERIFIED_SESSION_END_CLI = (0, 147, 0)
+MIN_VERIFIED_BASE_HOOKS_CLI = (0, 142, 3)
+RECOMMENDED_CODEX_CLI_VERSION = "0.147.0"
+_SEMVER_RE = re.compile(
+    r"^\s*codex(?:-cli)?\s+"
+    r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?\s*$",
+    re.IGNORECASE,
+)
+
 # Console-script filenames pip can produce. POSIX wheels create a bare
 # `vibesignal`; Windows wheels add a `.exe` launcher. Listing both keeps the
 # resolver correct across platforms.
 _SCRIPT_NAMES = ("vibesignal", "vibesignal.exe")
+
+
+@dataclass(frozen=True)
+class CodexCliInfo:
+    """The locally discoverable Codex CLI and its parsed semantic version."""
+
+    path: str | None
+    version: tuple[int, int, int] | None
+    raw_version: str | None
+
+
+class CodexCliInstallError(RuntimeError):
+    """Raised when the requested global Codex CLI installation cannot finish."""
 
 
 def _check_darwin() -> None:
@@ -420,6 +445,91 @@ def uninstall_autostart() -> bool:
 # that gap: they merge the hook block and pin ``vibesignal_args()`` the same
 # way, so ``pip install`` + ``install-hooks`` needs no PATH surgery.
 
+
+def _parse_semver(value: str) -> tuple[int, int, int] | None:
+    match = _SEMVER_RE.search(value)
+    if match is None:
+        return None
+    return tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+
+
+def detect_codex_cli() -> CodexCliInfo:
+    """Find Codex on PATH and parse the output of ``codex --version``."""
+    path = shutil.which("codex")
+    if path is None:
+        return CodexCliInfo(path=None, version=None, raw_version=None)
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return CodexCliInfo(path=path, version=None, raw_version=None)
+    raw = (result.stdout or result.stderr or "").strip()
+    version = _parse_semver(raw) if result.returncode == 0 else None
+    return CodexCliInfo(path=path, version=version, raw_version=raw or None)
+
+
+def _codex_meets_verified_floor(
+    info: CodexCliInfo, floor: tuple[int, int, int]
+) -> bool:
+    if info.version is None or info.version < floor:
+        return False
+    if info.version > floor or info.raw_version is None:
+        return True
+    match = _SEMVER_RE.search(info.raw_version)
+    return match is not None and match.group("prerelease") is None
+
+
+def codex_supports_base_hooks(info: CodexCliInfo) -> bool:
+    """Whether the CLI meets the oldest verified four-Hook review baseline."""
+    return _codex_meets_verified_floor(info, MIN_VERIFIED_BASE_HOOKS_CLI)
+
+
+def codex_supports_session_end(info: CodexCliInfo) -> bool:
+    """Whether the CLI meets VibeSignal's verified SessionEnd baseline."""
+    return _codex_meets_verified_floor(info, MIN_VERIFIED_SESSION_END_CLI)
+
+
+def install_recommended_codex_cli() -> CodexCliInfo:
+    """Install the exact tested Codex CLI release globally through npm."""
+    npm = shutil.which("npm")
+    if npm is None:
+        raise CodexCliInstallError(
+            "npm was not found. Install Node.js/npm, then retry, or install "
+            f"Codex CLI {RECOMMENDED_CODEX_CLI_VERSION} manually."
+        )
+    package = f"@openai/codex@{RECOMMENDED_CODEX_CLI_VERSION}"
+    try:
+        result = subprocess.run(
+            [npm, "install", "-g", package],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodexCliInstallError(f"Codex CLI installation failed: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "npm returned an error").strip()
+        raise CodexCliInstallError(f"Codex CLI installation failed: {detail}")
+
+    info = detect_codex_cli()
+    if not codex_supports_session_end(info):
+        detected = info.raw_version or "not found on PATH"
+        raise CodexCliInstallError(
+            "Codex CLI was installed but the verified version could not be detected "
+            f"(detected: {detected})."
+        )
+    return info
+
 def claude_settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
@@ -453,7 +563,9 @@ def _hook_command(args: list[str], tail: list[str]) -> str:
     return " ".join(shlex.quote(a) for a in [*args, *tail])
 
 
-def agent_hooks_spec(args: list[str], agent: str) -> dict:
+def agent_hooks_spec(
+    args: list[str], agent: str, include_session_end: bool = True
+) -> dict:
     """The vibesignal hook block for one agent, ready to merge.
 
     Claude Code and Codex use DIFFERENT hook vocabularies, so the spec is
@@ -471,7 +583,7 @@ def agent_hooks_spec(args: list[str], agent: str) -> dict:
         # Codex parses a hook's stdout as JSON, so every Codex command passes
         # --quiet to keep stdout empty (the state is still recorded); without it
         # Codex reports "hook returned invalid post-tool-use JSON output".
-        return {
+        spec = {
             "UserPromptSubmit": [
                 {"hooks": [cmd("event", "--agent", agent, "--state", "working", "--quiet")]},
             ],
@@ -484,10 +596,12 @@ def agent_hooks_spec(args: list[str], agent: str) -> dict:
             "Stop": [
                 {"hooks": [cmd("event", "--agent", agent, "--state", "done", "--quiet")]},
             ],
-            "SessionEnd": [
-                {"hooks": [cmd("end", "--agent", agent, "--quiet")]},
-            ],
         }
+        if include_session_end:
+            spec["SessionEnd"] = [
+                {"hooks": [cmd("end", "--agent", agent, "--quiet")]},
+            ]
+        return spec
 
     return {
         "UserPromptSubmit": [
@@ -704,7 +818,7 @@ def _write_settings(path: Path, settings: dict) -> None:
         raise
 
 
-def install_hooks(agent: str = "claude") -> Path:
+def install_hooks(agent: str = "claude", include_session_end: bool = True) -> Path:
     """Merge the vibesignal hook block for `agent` and pin the absolute path.
 
     Cross-platform. Idempotent: re-running re-pins ``vibesignal_args()`` and
@@ -718,7 +832,10 @@ def install_hooks(agent: str = "claude") -> Path:
     with lock.file_lock(_settings_lock_path(path)):
         settings = _load_settings_obj(path)
         _backup_once(path)
-        _merge_hooks(settings, agent_hooks_spec(args, agent))
+        _merge_hooks(
+            settings,
+            agent_hooks_spec(args, agent, include_session_end=include_session_end),
+        )
         _write_settings(path, settings)
     return path
 

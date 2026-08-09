@@ -2,6 +2,7 @@ import io
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 from vibesignal import __main__ as cli
@@ -320,6 +321,262 @@ def test_install_autostart_message_is_macos_on_darwin(capsys, monkeypatch):
     assert cli.cmd_install_autostart(None) == 0
     out = capsys.readouterr().out
     assert "LaunchAgent" in out
+
+
+def _codex_info(version=None, *, installed=True, raw=None):
+    from vibesignal import installer
+
+    return installer.CodexCliInfo(
+        path="C:/tools/codex.exe" if installed else None,
+        version=version,
+        raw_version=raw,
+    )
+
+
+def test_install_hooks_codex_missing_cli_refusal_leaves_integration_disabled(
+    capsys, monkeypatch
+):
+    from vibesignal import installer
+
+    installed_hooks = []
+    monkeypatch.setattr(installer, "detect_codex_cli", lambda: _codex_info(installed=False))
+    monkeypatch.setattr(installer, "install_hooks", lambda *args, **kwargs: installed_hooks.append(kwargs))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=False))
+
+    assert result == 2
+    assert installed_hooks == []
+    assert "not enabled" in capsys.readouterr().out.lower()
+
+
+def test_install_hooks_codex_missing_cli_consent_installs_full_mode(
+    capsys, monkeypatch, tmp_path
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(installer, "detect_codex_cli", lambda: _codex_info(installed=False))
+    monkeypatch.setattr(
+        installer,
+        "install_recommended_codex_cli",
+        lambda: calls.append("cli") or _codex_info((0, 147, 0), raw="codex-cli 0.147.0"),
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_hooks",
+        lambda agent, include_session_end=True: calls.append((agent, include_session_end))
+        or tmp_path / "hooks.json",
+    )
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 0
+    assert calls == ["cli", ("codex", True)]
+    out = capsys.readouterr().out.lower()
+    assert "full mode" in out
+    assert "npm install -g @openai/codex@0.147.0" in out
+    assert "/hooks" in out
+
+
+def test_install_hooks_codex_old_cli_refusal_uses_compatibility_mode(
+    capsys, monkeypatch, tmp_path
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(
+        installer, "detect_codex_cli",
+        lambda: _codex_info((0, 142, 3), raw="codex-cli 0.142.3"),
+    )
+    monkeypatch.setattr(installer, "install_recommended_codex_cli", lambda: calls.append("upgrade"))
+    monkeypatch.setattr(
+        installer,
+        "install_hooks",
+        lambda agent, include_session_end=True: calls.append((agent, include_session_end))
+        or tmp_path / "hooks.json",
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=False))
+
+    assert result == 0
+    assert calls == [("codex", False)]
+    assert "compatibility mode" in capsys.readouterr().out.lower()
+
+
+def test_install_hooks_codex_old_cli_consent_upgrades_to_full_mode(
+    monkeypatch, tmp_path
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(
+        installer, "detect_codex_cli",
+        lambda: _codex_info((0, 142, 3), raw="codex-cli 0.142.3"),
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_recommended_codex_cli",
+        lambda: calls.append("upgrade") or _codex_info((0, 147, 0)),
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_hooks",
+        lambda agent, include_session_end=True: calls.append((agent, include_session_end))
+        or tmp_path / "hooks.json",
+    )
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 0
+    assert calls == ["upgrade", ("codex", True)]
+
+
+def test_install_hooks_codex_newer_cli_is_never_reinstalled(
+    capsys, monkeypatch, tmp_path
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(
+        installer, "detect_codex_cli",
+        lambda: _codex_info((0, 200, 0), raw="codex-cli 0.200.0"),
+    )
+    monkeypatch.setattr(installer, "install_recommended_codex_cli", lambda: calls.append("upgrade"))
+    monkeypatch.setattr(
+        installer,
+        "install_hooks",
+        lambda agent, include_session_end=True: calls.append((agent, include_session_end))
+        or tmp_path / "hooks.json",
+    )
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 0
+    assert calls == [("codex", True)]
+    out = capsys.readouterr().out.lower()
+    assert "codex-cli 0.200.0" in out
+    assert "full mode" in out
+
+
+def test_install_hooks_codex_unknown_version_writes_no_hooks(
+    capsys, monkeypatch
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(
+        installer, "detect_codex_cli",
+        lambda: _codex_info(None, raw="Codex development build"),
+    )
+    monkeypatch.setattr(installer, "install_recommended_codex_cli", lambda: calls.append("upgrade"))
+    monkeypatch.setattr(installer, "install_hooks", lambda *args, **kwargs: calls.append("hooks"))
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 2
+    assert calls == []
+    assert "not enabled" in capsys.readouterr().out.lower()
+
+
+def test_install_hooks_codex_below_base_floor_refusal_writes_no_hooks(
+    capsys, monkeypatch
+):
+    from vibesignal import installer
+
+    calls = []
+    monkeypatch.setattr(
+        installer, "detect_codex_cli",
+        lambda: _codex_info((0, 100, 0), raw="codex-cli 0.100.0"),
+    )
+    monkeypatch.setattr(installer, "install_hooks", lambda *args, **kwargs: calls.append("hooks"))
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=False))
+
+    assert result == 2
+    assert calls == []
+    assert "not enabled" in capsys.readouterr().out.lower()
+
+
+def test_install_hooks_codex_missing_cli_install_failure_writes_no_hooks(
+    capsys, monkeypatch
+):
+    from vibesignal import installer
+
+    installed_hooks = []
+    monkeypatch.setattr(installer, "detect_codex_cli", lambda: _codex_info(installed=False))
+    monkeypatch.setattr(
+        installer,
+        "install_recommended_codex_cli",
+        lambda: (_ for _ in ()).throw(installer.CodexCliInstallError("npm unavailable")),
+    )
+    monkeypatch.setattr(installer, "install_hooks", lambda *args, **kwargs: installed_hooks.append(kwargs))
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 2
+    assert installed_hooks == []
+    assert "npm unavailable" in capsys.readouterr().err
+
+
+def test_install_hooks_codex_old_cli_upgrade_failure_falls_back(
+    capsys, monkeypatch, tmp_path
+):
+    from vibesignal import installer
+
+    calls = []
+    detection_count = []
+
+    def detect_old_cli():
+        detection_count.append(1)
+        return _codex_info((0, 142, 3), raw="codex-cli 0.142.3")
+
+    monkeypatch.setattr(installer, "detect_codex_cli", detect_old_cli)
+    monkeypatch.setattr(
+        installer,
+        "install_recommended_codex_cli",
+        lambda: (_ for _ in ()).throw(installer.CodexCliInstallError("network failed")),
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_hooks",
+        lambda agent, include_session_end=True: calls.append((agent, include_session_end))
+        or tmp_path / "hooks.json",
+    )
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 0
+    assert len(detection_count) == 2
+    assert calls == [("codex", False)]
+    assert "network failed" in capsys.readouterr().err
+
+
+def test_install_hooks_codex_upgrade_failure_that_removes_cli_writes_no_hooks(
+    capsys, monkeypatch
+):
+    from vibesignal import installer
+
+    detections = iter([
+        _codex_info((0, 142, 3), raw="codex-cli 0.142.3"),
+        _codex_info(installed=False),
+    ])
+    installed_hooks = []
+    monkeypatch.setattr(installer, "detect_codex_cli", lambda: next(detections))
+    monkeypatch.setattr(
+        installer,
+        "install_recommended_codex_cli",
+        lambda: (_ for _ in ()).throw(installer.CodexCliInstallError("upgrade failed")),
+    )
+    monkeypatch.setattr(installer, "install_hooks", lambda *args, **kwargs: installed_hooks.append(1))
+
+    result = cli.cmd_install_hooks(types.SimpleNamespace(agent="codex", yes=True))
+
+    assert result == 2
+    assert installed_hooks == []
+    assert "not enabled" in capsys.readouterr().out.lower()
 
 
 def test_version_matches_pyproject():

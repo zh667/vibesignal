@@ -227,12 +227,122 @@ def cmd_uninstall_autostart(args) -> int:
     return 0
 
 
+def _confirm(prompt: str) -> bool:
+    """Ask an EOF-safe, default-no confirmation question."""
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def cmd_install_hooks(args) -> int:
     from . import installer
-    path = installer.install_hooks(agent=args.agent)
+
+    include_session_end = True
+    if args.agent == "codex":
+        info = installer.detect_codex_cli()
+        assume_yes = getattr(args, "yes", False)
+        recommended = installer.RECOMMENDED_CODEX_CLI_VERSION
+        npm_command = f"npm install -g @openai/codex@{recommended}"
+
+        if info.path is None:
+            print(
+                "[vibesignal] Codex CLI was not found. It is needed to review "
+                "and trust Codex Desktop Hooks, but not while the widget runs."
+            )
+            print(f"[vibesignal] Proposed command: {npm_command}")
+            consent = assume_yes or _confirm(
+                f"Install the verified Codex CLI {recommended} globally with npm?"
+            )
+            if not consent:
+                print("[vibesignal] Codex Hook integration not enabled.")
+                return 2
+            try:
+                info = installer.install_recommended_codex_cli()
+            except installer.CodexCliInstallError as exc:
+                print(f"[vibesignal] {exc}", file=sys.stderr)
+                print("[vibesignal] Codex Hook integration not enabled.")
+                return 2
+        elif info.version is None:
+            detected = info.raw_version or "version command failed"
+            print(
+                f"[vibesignal] Detected Codex CLI ({detected}), but its version "
+                "could not be verified. The global CLI will not be changed."
+            )
+            print(
+                "[vibesignal] Codex Hook integration not enabled because a "
+                "verified /hooks review path is unavailable."
+            )
+            return 2
+        elif not installer.codex_supports_session_end(info):
+            detected = info.raw_version or ".".join(map(str, info.version))
+            base_supported = installer.codex_supports_base_hooks(info)
+            print(
+                f"[vibesignal] Detected {detected}; VibeSignal has verified "
+                f"SessionEnd review starting at Codex CLI {recommended}."
+            )
+            if not base_supported:
+                base = ".".join(map(str, installer.MIN_VERIFIED_BASE_HOOKS_CLI))
+                print(
+                    "[vibesignal] This version is also below the oldest verified "
+                    f"four-Hook review version ({base})."
+                )
+            print(f"[vibesignal] Proposed command: {npm_command}")
+            consent = assume_yes or _confirm(
+                f"Upgrade the global Codex CLI to {recommended} with npm?"
+            )
+            if consent:
+                try:
+                    info = installer.install_recommended_codex_cli()
+                except installer.CodexCliInstallError as exc:
+                    print(f"[vibesignal] {exc}", file=sys.stderr)
+                    recovered = installer.detect_codex_cli()
+                    if installer.codex_supports_session_end(recovered):
+                        print(
+                            "[vibesignal] The CLI remains usable at the full "
+                            "Hook baseline; continuing in full mode."
+                        )
+                    elif installer.codex_supports_base_hooks(recovered):
+                        print(
+                            "[vibesignal] The existing CLI remains usable; "
+                            "continuing without SessionEnd."
+                        )
+                        include_session_end = False
+                    else:
+                        print(
+                            "[vibesignal] Codex Hook integration not enabled "
+                            "because no verified /hooks review path remains."
+                        )
+                        return 2
+            else:
+                if not base_supported:
+                    print(
+                        "[vibesignal] Codex Hook integration not enabled because "
+                        "this CLI is below the verified review baseline."
+                    )
+                    return 2
+                include_session_end = False
+        else:
+            detected = info.raw_version or ".".join(map(str, info.version))
+            print(f"[vibesignal] Detected {detected}; keeping the existing CLI.")
+
+    path = installer.install_hooks(
+        agent=args.agent, include_session_end=include_session_end
+    )
     print(f"[vibesignal] wired {args.agent} hooks into {path}")
     if args.agent == "codex":
-        print("Trust the new hooks once via /hooks in a Codex session, then restart it.")
+        if include_session_end:
+            print("[vibesignal] Codex Hook mode: full mode (SessionEnd enabled).")
+        else:
+            print(
+                "[vibesignal] Codex Hook mode: compatibility mode "
+                "(four Hooks; Stop + TTL cleanup)."
+            )
+        print(
+            "Run Codex CLI, enter /hooks, then review and trust the new Hooks "
+            "yourself. Restart Codex Desktop and send a test prompt afterward."
+        )
     else:
         print("Takes effect on the next Claude Code session (or a settings reload).")
     print("Re-run after switching env to re-pin the path.")
@@ -322,6 +432,13 @@ def main(argv: list | None = None) -> int:
     p_install_hooks.add_argument(
         "--agent", default="claude", choices=["claude", "codex"],
         help="which agent's settings file to wire (default: claude)",
+    )
+    p_install_hooks.add_argument(
+        "--yes", action="store_true",
+        help=(
+            "consent to install or upgrade the verified Codex CLI version "
+            "without an interactive prompt; Hook trust always remains manual"
+        ),
     )
     p_install_hooks.set_defaults(func=cmd_install_hooks)
 

@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - The verified `SessionEnd` baseline is exactly `0.147.0`.
+- The verified four-Hook review baseline is exactly `0.142.3`.
 - Never silently install, upgrade, or downgrade the user's global Codex CLI.
 - Never automate Hook trust or modify Codex's trust database.
 - Preserve all foreign Hook handlers and existing command compatibility.
@@ -86,7 +87,7 @@ Expected: all selected tests pass.
 
 **Interfaces:**
 - Adds: `install-hooks --yes` for explicit CLI install or upgrade consent.
-- Changes: `cmd_install_hooks(args)` returns nonzero when a missing CLI is declined or cannot be installed; old and unknown CLIs use compatibility mode when upgrade is declined or unavailable.
+- Changes: `cmd_install_hooks(args)` returns nonzero when a verified review path is unavailable; CLI versions from `0.142.3` through `0.146.x` may use compatibility mode when upgrade is declined or unavailable.
 
 - [ ] **Step 1: Write failing command workflow tests**
 
@@ -117,4 +118,3 @@ Expected: all runnable tests pass; platform-dependent skips remain explicitly re
 - [ ] **Step 6: Commit and push**
 
 Commit the implementation and tests on `windows-codex-desktop-compat`, then push that branch to the configured fork remote.
-
