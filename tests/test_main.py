@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -282,6 +283,62 @@ def test_status_lists_blocked_older_than_store_ttl(tmp_path, monkeypatch):
     assert proc.returncode == 0
     assert "claude/s1" in proc.stdout
     assert "(no active sessions)" not in proc.stdout
+
+
+def test_status_json_emits_empty_machine_readable_snapshot(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status", "--json"],
+        capture_output=True, encoding="utf-8", timeout=10, env=_child_env(tmp_path),
+    )
+
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout) == {"aggregate": "idle", "sessions": []}
+    assert proc.stderr == ""
+
+
+def test_status_json_preserves_unicode_and_resolved_priority(tmp_path):
+    env = _child_env(tmp_path)
+    for agent, session, state, project in (
+        ("codex", "working-session", "working", "等待期实验"),
+        ("codex", "blocked-session", "blocked", "中文项目"),
+    ):
+        subprocess.run(
+            [sys.executable, "-m", "vibesignal", "event", "--agent", agent,
+             "--state", state, "--session", session, "--project", project,
+             "--quiet"],
+            input="{}", capture_output=True, text=True, timeout=10, env=env,
+            check=True,
+        )
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status", "--json"],
+        capture_output=True, encoding="utf-8", timeout=10, env=env, check=True,
+    )
+    payload = json.loads(proc.stdout)
+
+    assert payload["aggregate"] == "blocked"
+    assert [row["session"] for row in payload["sessions"]] == [
+        "blocked-session", "working-session"
+    ]
+    assert [row["project"] for row in payload["sessions"]] == [
+        "中文项目", "等待期实验"
+    ]
+    assert all(set(row) == {"agent", "session", "project", "state", "ts"}
+               for row in payload["sessions"])
+
+
+def test_status_json_ignores_corrupt_state_file(tmp_path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "broken.json").write_text("{not json", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status", "--json"],
+        capture_output=True, encoding="utf-8", timeout=10, env=_child_env(tmp_path),
+    )
+
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout) == {"aggregate": "idle", "sessions": []}
 
 
 # ----- Platform-aware install messaging. The installer dispatches by platform

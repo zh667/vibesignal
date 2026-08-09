@@ -125,6 +125,19 @@ def cmd_status(args) -> int:
     # the store directly would hide a long-blocked session the light still shows.
     rows = resolve_per_session()
     state, color = resolve_color()
+    if args.json:
+        sessions = [
+            {key: row[key] for key in ("agent", "session", "project", "state", "ts")}
+            for row in rows
+        ]
+        reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+        print(json.dumps({"aggregate": state, "sessions": sessions}, ensure_ascii=False))
+        return 0
     print(f"aggregate: {state}  color: {color}  (last applied: {store.get_last_color()})")
     for r in rows:
         print(f"  {r['agent']}/{r['session']}: {r['state']} project={r['project']}")
@@ -372,6 +385,7 @@ def main(argv: list | None = None) -> int:
     p_event.set_defaults(func=cmd_event)
 
     p_status = sub.add_parser("status", help="print active sessions and the resolved color")
+    p_status.add_argument("--json", action="store_true", help="print one UTF-8 JSON snapshot")
     p_status.set_defaults(func=cmd_status)
 
     p_clear = sub.add_parser("clear", help="clear one or all sessions")
