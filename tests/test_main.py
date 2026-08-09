@@ -1,3 +1,4 @@
+import io
 import os
 import subprocess
 import sys
@@ -44,6 +45,75 @@ def test_event_reads_session_from_stdin(tmp_path):
     )
     assert proc.returncode == 0
     assert "claude/xyz" in proc.stdout
+
+
+def test_event_reads_newline_json_without_waiting_for_eof(tmp_path):
+    env = _child_env(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "vibesignal", "event", "--agent", "claude",
+         "--state", "working", "--quiet"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write('{"session_id":"held-open","cwd":"C:/p/proj"}\n')
+    proc.stdin.flush()
+    try:
+        proc.wait(timeout=3)
+    finally:
+        proc.stdin.close()
+
+    assert proc.returncode == 0
+    status = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status"],
+        capture_output=True, text=True, timeout=10, env=env,
+    )
+    assert "claude/held-open" in status.stdout
+    assert "claude/default" not in status.stdout
+
+
+def test_hook_stdin_preserves_utf8_when_console_encoding_is_gbk(monkeypatch):
+    payload = '{"session_id":"utf8","cwd":"E:/BaiduNetdiskDownload/我的世界存档"}\n'
+    stdin = io.TextIOWrapper(io.BytesIO(payload.encode("utf-8")), encoding="gbk")
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    hook = cli._read_hook_stdin()
+
+    assert hook["cwd"].endswith("我的世界存档")
+
+
+def test_codex_hook_without_transcript_is_ignored(tmp_path):
+    env = _child_env(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "event", "--agent", "codex",
+         "--state", "working", "--quiet"],
+        input='{"session_id":"internal","cwd":"C:/Program Files/Codex/app",'
+              '"hook_event_name":"UserPromptSubmit","transcript_path":null}',
+        capture_output=True, text=True, timeout=10, env=env,
+    )
+    assert proc.returncode == 0
+    status = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status"],
+        capture_output=True, text=True, timeout=10, env=env,
+    )
+    assert "codex/internal" not in status.stdout
+
+
+def test_codex_hook_with_transcript_is_recorded(tmp_path):
+    env = _child_env(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "event", "--agent", "codex",
+         "--state", "working", "--quiet"],
+        input='{"session_id":"user-thread","cwd":"C:/p/project",'
+              '"hook_event_name":"UserPromptSubmit","transcript_path":"C:/logs/rollout.jsonl"}',
+        capture_output=True, text=True, timeout=10, env=env,
+    )
+    assert proc.returncode == 0
+    status = subprocess.run(
+        [sys.executable, "-m", "vibesignal", "status"],
+        capture_output=True, text=True, timeout=10, env=env,
+    )
+    assert "codex/user-thread" in status.stdout
 
 
 def test_event_quiet_suppresses_normal_stdout(tmp_path):

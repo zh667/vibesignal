@@ -72,6 +72,13 @@ def test_codex_snippet_maps_turn_states():
     assert "done" in json.dumps(hooks["Stop"])
 
 
+def test_codex_snippet_sessionend_clears_session():
+    sessionend = json.dumps(_codex_snippet()["hooks"]["SessionEnd"])
+    assert "vibesignal end" in sessionend
+    assert "--agent codex" in sessionend
+    assert "--quiet" in sessionend
+
+
 def test_codex_notify_fallback_uses_quiet_vibesignal():
     text = (PROJECT_ROOT / "hooks" / "codex-notify.py").read_text(encoding="utf-8")
     assert "signal_light" not in text

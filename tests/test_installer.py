@@ -336,11 +336,27 @@ def test_agent_hooks_spec_codex_tag():
     assert all("--agent codex" in c for c in _all_commands(spec))
 
 
-def test_hook_command_quotes_spaces():
+def test_hook_command_quotes_spaces(monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
     cmd = installer._hook_command(
         ["/Users/jane doe/vibesignal"], ["event", "--state", "working"])
     assert "'/Users/jane doe/vibesignal'" in cmd
     assert cmd.endswith("event --state working")
+
+
+def test_hook_command_invokes_quoted_executable_on_windows(monkeypatch):
+    monkeypatch.setattr("sys.platform", "win32")
+    cmd = installer._hook_command(
+        [r"C:\Program Files\VibeSignal\vibesignal.exe"],
+        ["event", "--state", "working"],
+    )
+    assert cmd == (
+        "& 'C:\\Program Files\\VibeSignal\\vibesignal.exe' "
+        "'event' '--state' 'working'"
+    )
+    assert installer._hook_is_vibesignal({
+        "command": cmd.replace("'--state' 'working'", "'--agent' 'codex'")
+    }) is True
 
 
 def test_merge_hooks_preserves_and_is_idempotent():
@@ -454,12 +470,14 @@ def test_unknown_agent_rejected():
 
 def test_agent_hooks_spec_codex_uses_permissionrequest():
     # Codex's approval/input event is PermissionRequest, NOT Claude's
-    # Notification/permission_prompt, and Codex has no StopFailure/SessionEnd.
+    # Notification/permission_prompt. It has SessionEnd but no StopFailure.
     spec = installer.agent_hooks_spec(["/env/bin/vibesignal"], "codex")
     assert "PermissionRequest" in spec
     assert "Notification" not in spec
     assert "--state blocked" in spec["PermissionRequest"][0]["hooks"][0]["command"]
-    assert "StopFailure" not in spec and "SessionEnd" not in spec
+    assert "StopFailure" not in spec
+    assert "SessionEnd" in spec
+    assert "end --agent codex --quiet" in spec["SessionEnd"][0]["hooks"][0]["command"]
     # Claude keeps the full Claude vocabulary and does NOT use PermissionRequest.
     claude = installer.agent_hooks_spec(["/env/bin/vibesignal"], "claude")
     assert "Notification" in claude and "SessionEnd" in claude
@@ -585,8 +603,8 @@ def test_merge_hooks_keeps_foreign_sibling_in_same_entry():
 
 def test_merge_hooks_converges_events_dropped_from_spec():
     # A prior install left codex hooks under events the CURRENT spec no longer
-    # emits (Notification/SessionEnd, from before the schema fix). Re-install must
-    # drop those stale vibesignal handlers, not just re-pin the current event set.
+    # emits (Notification) plus an old SessionEnd command. Re-install must drop
+    # removed events and replace stale handlers with the current pinned command.
     settings = {"hooks": {
         "Notification": [{"matcher": "permission_prompt", "hooks": [
             {"type": "command", "command": "/old/vibesignal event --agent codex --state blocked"}]}],
@@ -598,7 +616,9 @@ def test_merge_hooks_converges_events_dropped_from_spec():
     installer._merge_hooks(settings, installer.agent_hooks_spec(["/new/vibesignal"], "codex"))
     hooks = settings["hooks"]
     assert "Notification" not in hooks   # stale vibesignal-only event dropped
-    assert "SessionEnd" not in hooks     # stale vibesignal-only event dropped
+    session_end = json.dumps(hooks["SessionEnd"])
+    assert "/old/vibesignal" not in session_end
+    assert "/new/vibesignal end --agent codex --quiet" in session_end
     posttool = [h["command"] for e in hooks["PostToolUse"] for h in e["hooks"]]
     assert "/opt/foreign.sh" in posttool  # foreign sibling preserved
     assert any(c.endswith("--quiet") and "/new/vibesignal" in c for c in posttool)

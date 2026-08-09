@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 import xml.sax.saxutils
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from . import lock
 
@@ -441,9 +441,15 @@ def _agent_settings_path(agent: str) -> Path:
 def _hook_command(args: list[str], tail: list[str]) -> str:
     """Join the pinned argv with a hook tail into one shell command string.
 
-    Each token is shlex-quoted so a vibesignal path with a space survives the
-    round-trip through the settings JSON and the hook shell.
+    Each token is quoted for the platform shell so a vibesignal path with a
+    space survives the round-trip through the settings JSON and hook runner.
     """
+    if (
+        sys.platform == "win32"
+        and args
+        and PureWindowsPath(args[0]).is_absolute()
+    ):
+        return "& " + " ".join(_ps_squote(a) for a in [*args, *tail])
     return " ".join(shlex.quote(a) for a in [*args, *tail])
 
 
@@ -454,10 +460,9 @@ def agent_hooks_spec(args: list[str], agent: str) -> dict:
     per-agent (verified against the official Codex hooks docs, developers.
     openai.com/codex/hooks): Codex's approval/input event is ``PermissionRequest``
     (Claude uses ``Notification`` with ``permission_prompt`` / ``idle_prompt``
-    matchers), and Codex has no ``StopFailure`` or ``SessionEnd``. A closed Codex
-    session therefore has no session-close hook and ages out by its per-state TTL
-    instead of clearing at once; ``Stop`` still carries the "your move" (done)
-    signal. Both agents share ``UserPromptSubmit`` / ``PostToolUse`` / ``Stop``.
+    matchers), and Codex has no ``StopFailure``. Both agents support
+    ``SessionEnd`` for precise cleanup and share ``UserPromptSubmit`` /
+    ``PostToolUse`` / ``Stop``; ``Stop`` carries the "your move" (done) signal.
     """
     def cmd(*tail: str) -> dict:
         return {"type": "command", "command": _hook_command(args, list(tail))}
@@ -478,6 +483,9 @@ def agent_hooks_spec(args: list[str], agent: str) -> dict:
             ],
             "Stop": [
                 {"hooks": [cmd("event", "--agent", agent, "--state", "done", "--quiet")]},
+            ],
+            "SessionEnd": [
+                {"hooks": [cmd("end", "--agent", agent, "--quiet")]},
             ],
         }
 
@@ -537,6 +545,8 @@ def _hook_is_vibesignal(h: object) -> bool:
         argv = shlex.split(command)
     except ValueError:
         return False
+    if argv[:1] == ["&"]:
+        argv = argv[1:]
     return _argv_is_vibesignal(argv)
 
 
@@ -620,10 +630,10 @@ def _merge_hooks(settings: dict, spec: dict) -> None:
     """Merge spec into settings['hooks'] in place, idempotently and convergently.
 
     First strip ALL prior vibesignal handlers across every event -- not just the
-    events in the new spec -- so a re-install after the agent's event set changed
-    (e.g. old Codex Notification / SessionEnd entries from before the schema fix)
-    leaves no orphans. Foreign hooks, including a command that shares a matcher
-    group with one of ours, are preserved. Then append the fresh block.
+    events in the new spec -- so a re-install after the agent's event set or
+    command format changed leaves no obsolete handlers. Foreign hooks, including
+    a command that shares a matcher group with one of ours, are preserved. Then
+    append the fresh block.
     """
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):

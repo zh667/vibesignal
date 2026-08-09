@@ -8,9 +8,10 @@ Usage:
 
 The `event` command reads the session id from the hook's stdin JSON when
 `--session` is not given, and always exits 0 so a hook can never block the agent.
-The stdin read is bounded by a short timeout, so an open but dataless pipe cannot
-hang the hook; the record -> resolve -> set-light -> cache critical section is held
-under a cross-process lock so concurrent hooks cannot race the device.
+The single-line stdin read is bounded by a short timeout, so it does not wait for
+the hook runner to close the pipe and an open but dataless pipe cannot hang the
+hook. The record -> resolve -> set-light -> cache critical section is held under a
+cross-process lock so concurrent hooks cannot race the device.
 """
 
 from __future__ import annotations
@@ -43,11 +44,23 @@ def _read_hook_stdin(timeout: float = STDIN_TIMEOUT_SECONDS) -> dict:
     if sys.stdin is None or sys.stdin.isatty():
         return {}
 
+    # Hook payloads are UTF-8 JSON. On Windows, Python may otherwise inherit a
+    # Chinese console code page and turn paths such as "我的世界存档" into mojibake.
+    reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+
     result: "queue.Queue[str]" = queue.Queue(maxsize=1)
 
     def read_stdin() -> None:
         try:
-            raw = sys.stdin.read()
+            # Codex and Claude hooks send one JSON object. Reading one line lets
+            # us proceed as soon as the payload arrives, even if the runner keeps
+            # its stdin pipe open until after the hook process exits.
+            raw = sys.stdin.readline()
         except Exception:
             raw = ""
         try:
@@ -55,8 +68,8 @@ def _read_hook_stdin(timeout: float = STDIN_TIMEOUT_SECONDS) -> dict:
         except queue.Full:
             pass
 
-    # Daemon thread: if stdin never reaches EOF, the read is abandoned at exit
-    # instead of hanging the hook.
+    # Daemon thread: if stdin has no data, the read is abandoned at exit instead
+    # of hanging the hook.
     threading.Thread(target=read_stdin, daemon=True).start()
     try:
         raw = result.get(timeout=timeout)
@@ -67,7 +80,7 @@ def _read_hook_stdin(timeout: float = STDIN_TIMEOUT_SECONDS) -> dict:
         return {}
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -85,6 +98,12 @@ def _apply_light() -> tuple[str, list | None]:
 def cmd_event(args) -> int:
     try:
         hook = _read_hook_stdin()
+        # Codex Desktop runs private background sessions for ambient suggestion
+        # generation and safety checks. They have session ids and trigger global
+        # hooks, but no user transcript, so they must not appear as coding tasks.
+        # An explicit --session remains available for manual simulation.
+        if args.agent == "codex" and args.session is None and not hook.get("transcript_path"):
+            return 0
         session = args.session or hook.get("session_id") or "default"
         cwd = str(hook.get("cwd") or os.getcwd())
         project = args.project or os.path.basename(cwd.rstrip("/\\")) or None
